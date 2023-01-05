@@ -2441,3 +2441,179 @@ tile=dict(
 )
 
 generate_onnx_single_operator(tile, "tile")
+
+def gen_mutli_head_attention(input_shape=[1, 50, 768], num_heads=12, constant_as_initializers=False):
+    X = onnx.helper.make_tensor_value_info("X", onnx.TensorProto.FLOAT, input_shape)
+    Y = onnx.helper.make_tensor_value_info("Y", onnx.TensorProto.FLOAT, input_shape)
+    nodes = []
+    initializers = []
+
+    class NodeNameManager:
+        def __init__(self):
+            self.name_dict = dict()
+
+        def get_name(self, op_type):
+            if op_type in self.name_dict:
+                self.name_dict[op_type] += 1
+            else:
+                self.name_dict[op_type] = 0
+            
+            return "{}.{}".format(op_type, self.name_dict[op_type])
+
+    node_name_manager = NodeNameManager()
+
+    def make_node(op_type, inputs=None, outputs=None, *args, **kwargs):
+        nonlocal node_name_manager, nodes
+        node_name = node_name_manager.get_name(op_type)
+
+        if inputs is None:
+            inputs = [nodes[-1].output[0]]
+        if outputs is None:
+            outputs = ["{}.out".format(node_name)]
+        return [onnx.helper.make_node(op_type, inputs, outputs, *args, **kwargs)]
+
+    def make_node_with_constant(op_type, constant_value, inputs=None, is_constant_scalar=False, const_append=True):
+        nonlocal node_name_manager, nodes, initializers, constant_as_initializers
+        node_name = node_name_manager.get_name(op_type)
+
+        constant_shape = [] if is_constant_scalar else constant_value.shape
+        tensor = onnx.helper.make_tensor(
+            "Const.{}.tensor".format(node_name),
+            onnx.mapping.NP_TYPE_TO_TENSOR_TYPE[constant_value.dtype],
+            constant_shape,
+            vals=constant_value
+        )
+        if inputs is None:
+            inputs = [nodes[-1].output[0]]
+        outputs = ["{}.out".format(node_name)]
+
+        if constant_as_initializers:
+            if const_append:
+                inputs = inputs + [tensor.name]
+            else:
+                inputs = [tensor.name] + inputs
+            initializers += [tensor]
+            return [onnx.helper.make_node(op_type, inputs, outputs, node_name)]
+        else:
+            node_const = onnx.helper.make_node("Constant", [], ["Const.{}.out".format(node_name)], value=tensor)
+
+            if const_append:
+                inputs = inputs + [node_const.output[0]]
+            else:
+                inputs = [node_const.output[0]] + inputs
+            return [node_const, onnx.helper.make_node(op_type, inputs, outputs, node_name)]
+
+    def make_slice(inputs=None, starts=0, ends=-1, axes=0):
+        nonlocal node_name_manager, nodes, initializers, constant_as_initializers
+        node_name = node_name_manager.get_name("Slice")
+
+        # starts
+        tensor_starts = onnx.helper.make_tensor("Const.{}.starts.tensor".format(node_name), onnx.TensorProto.INT64, [1], vals=[starts])
+        # ends
+        tensor_ends = onnx.helper.make_tensor("Const.{}.ends.tensor".format(node_name), onnx.TensorProto.INT64, [1], vals=[ends])
+        # axes
+        tensor_axes = onnx.helper.make_tensor("Const.{}.axes.tensor".format(node_name), onnx.TensorProto.INT64, [1], vals=[axes])
+
+        if inputs is None:
+            inputs = [nodes[-1].output[0]]
+        outputs = ["{}.out".format(node_name)]
+
+        if constant_as_initializers:
+            inputs += [tensor_starts.name, tensor_ends.name, tensor_axes.name]
+            initializers += [tensor_starts, tensor_ends, tensor_axes]
+            return [onnx.helper.make_node("Slice", inputs, outputs, node_name)]
+        else:
+            node_const_starts = onnx.helper.make_node("Constant", [], ["Const.{}.starts".format(node_name)], value=tensor_starts)
+            node_const_ends = onnx.helper.make_node("Constant", [], ["Const.{}.ends".format(node_name)], value=tensor_ends)
+            node_const_axes = onnx.helper.make_node("Constant", [], ["Const.{}.axes".format(node_name)], value=tensor_axes)
+            inputs = inputs + [node_const_starts.output[0], node_const_ends.output[0], node_const_axes.output[0]]
+            return [node_const_starts, node_const_ends, node_const_axes, onnx.helper.make_node("Slice", inputs, outputs, node_name)]
+
+    def make_gemm(inputs=None, hidden_dim=768):
+        nonlocal node_name_manager, nodes, initializers, constant_as_initializers
+        node_name = node_name_manager.get_name("Gemm")
+
+        # B
+        tensor_B = onnx.helper.make_tensor("Const.{}.B.tensor".format(node_name), onnx.TensorProto.FLOAT, [hidden_dim, hidden_dim], vals=np.random.rand(hidden_dim, hidden_dim).astype(np.float32))
+        # C
+        tensor_C = onnx.helper.make_tensor("Const.{}.C.tensor".format(node_name), onnx.TensorProto.FLOAT, [hidden_dim], vals=np.random.rand(hidden_dim).astype(np.float32))
+
+        if inputs is None:
+            inputs = [nodes[-1].output[0]]
+        outputs = ["{}.out".format(node_name)]
+
+        if constant_as_initializers:
+            inputs += [tensor_B.name, tensor_C.name]
+            initializers += [tensor_B, tensor_C]
+            return [onnx.helper.make_node("Gemm", inputs, outputs, alpha=1.0, beta=1.0, transB=1)]
+        else:
+            node_const_B = onnx.helper.make_node("Constant", [], ["Const.{}.B".format(node_name)], value=tensor_B)
+            node_const_C = onnx.helper.make_node("Constant", [], ["Const.{}.C".format(node_name)], value=tensor_C)
+            inputs = inputs + [node_const_B.output[0], node_const_C.output[0]]
+            return [node_const_B, node_const_C, onnx.helper.make_node("Gemm", inputs, outputs, alpha=1.0, beta=1.0, transB=1)]
+
+    #                                 -> slice -> reshape -> transpose -----------------------------\
+    # x -> transpose -> matmul -> add -> slice -> reshape -> transpose -> div -> matlul -> softmax -> matmul -> tranpose -> reshape -> gemm -> reshape -> transpose
+    #                                 -> slice -> reshape -> transpose --------/
+
+    nodes += make_node("Transpose", ["X"], perm=np.array([1, 0, 2], dtype=np.int64))
+    nodes += make_node_with_constant("MatMul", np.random.rand(input_shape[-1], input_shape[-1]*3).astype(np.float32))
+    nodes += make_node_with_constant("Add", np.random.rand(input_shape[-1]*3).astype(np.float32), const_append=False)
+
+    # # -> slice -> reshape -> transpose -> div
+    node_add_0_outname = nodes[-1].output[0]
+    nodes += make_slice([node_add_0_outname], 0, input_shape[-1], -1)
+    nodes += make_node_with_constant("Reshape", np.array([input_shape[1], num_heads, input_shape[-1]/num_heads], dtype=np.int64))
+    nodes += make_node("Transpose", perm=np.array([1, 0, 2], dtype=np.int64))
+    nodes += make_node_with_constant("Div", np.array([8], dtype=np.float32), is_constant_scalar=True)
+    node_div_0_outname = nodes[-1].output[0]
+
+    # -> slice -> reshape -> transpose
+    nodes += make_slice([node_add_0_outname], input_shape[-1], input_shape[-1]*2, -1)
+    nodes += make_node_with_constant("Reshape", np.array([input_shape[1], num_heads, input_shape[-1]/num_heads], dtype=np.int64))
+    nodes += make_node("Transpose", perm=np.array([1, 2, 0], dtype=np.int64))
+
+    # -> matmul -> softmax
+    nodes += make_node("MatMul", [node_div_0_outname, nodes[-1].output[0]])
+    nodes += make_node("Softmax", axis=2)
+    node_softmax_0_outname = nodes[-1].output[0]
+
+    # -> slice -> reshape -> transpose
+    nodes += make_slice([node_add_0_outname], input_shape[-1]*2, input_shape[-1]*3, -1)
+    nodes += make_node_with_constant("Reshape", np.array([input_shape[1], num_heads, input_shape[-1]/num_heads], dtype=np.int64))
+    nodes += make_node("Transpose", perm=np.array([1, 0, 2], dtype=np.int64))
+
+    # -> matmul -> tranpose -> reshape -> gemm -> reshape -> transpose
+    nodes += make_node("MatMul", [node_softmax_0_outname, nodes[-1].output[0]])
+    nodes += make_node("Transpose", perm=np.array([1, 2, 0], dtype=np.int64))
+    nodes += make_node_with_constant("Reshape", np.array([input_shape[1], input_shape[-1]], dtype=np.int64))
+    nodes += make_gemm(hidden_dim=input_shape[-1])
+    nodes += make_node_with_constant("Reshape", np.array([input_shape[1], 1, input_shape[-1]], dtype=np.int64))
+    nodes += make_node("Transpose", outputs=["Y"], perm=np.array([1, 0, 2], dtype=np.int64))
+
+    graph_name = "multi_head_attention"
+    if constant_as_initializers:
+        graph_name += "with_initializers"
+    graph_def = onnx.helper.make_graph(
+        nodes,
+        graph_name,
+        [X],
+        [Y],
+        initializers
+    )
+    model_def = onnx.helper.make_model(graph_def, producer_name="github.com/opencv/opencv_extra")
+    onnx.checker.check_model(model_def)
+    shape_inferred_model_def = onnx.shape_inference.infer_shapes(model_def)
+    onnx.save(shape_inferred_model_def, "models/{}.onnx".format(graph_name))
+
+    # infer & save data
+    input_blob = np.random.rand(*input_shape).astype(np.float32)
+
+    import onnxruntime as ort
+    sess = ort.InferenceSession("models/{}.onnx".format(graph_name))
+    output_blobs = sess.run(["Y"], {"X": input_blob})
+    np.save("data/input_{}.npy".format(graph_name), input_blob)
+    np.save("data/output_{}.npy".format(graph_name), output_blobs[0])
+
+gen_mutli_head_attention([1, 5, 12], 3)
+gen_mutli_head_attention([1, 5, 12], 3, constant_as_initializers=True)
